@@ -1,33 +1,35 @@
+"""Select and track a blue object while detecting a tennis ball from a webcam.
 
+Click inside a blue object to select it. Press r to reset selection; q or Esc quits.
+Install dependencies with: python -m pip install opencv-python numpy
+"""
+
+import math
 import cv2
 import numpy as np
-import math
 
-# HSV color ranges (adjust according to your lighting)
-BLUE_LOWER = np.array([90, 80, 50])
-BLUE_UPPER = np.array([135, 255, 255])
-
-BALL_LOWER = np.array([20, 80, 80])
-BALL_UPPER = np.array([45, 255, 255])
+# HSV ranges are starting values; tune these for the camera and lighting.
+BLUE_LOWER = np.array([90, 80, 50], dtype=np.uint8)
+BLUE_UPPER = np.array([135, 255, 255], dtype=np.uint8)
+BALL_LOWER = np.array([20, 80, 80], dtype=np.uint8)
+BALL_UPPER = np.array([45, 255, 255], dtype=np.uint8)
 
 MIN_BLUE_AREA = 300
 MIN_BALL_AREA = 150
+MAX_TRACK_DISTANCE = 150
+TRAIL_LENGTH = 100
+WINDOW = "Blue Object and Tennis Ball"
 
-selected_blue_center = None
-previous_blue_center = None
-blue_tracking_points = []
-selected_blue_contour = None
+selected_center = None
+previous_center = None
+tracking_points = []
+current_blue_contours = []
 
 
 def clean_mask(mask):
     kernel = np.ones((5, 5), np.uint8)
-    mask = cv2.morphologyEx(
-        mask, cv2.MORPH_OPEN, kernel
-    )
-    mask = cv2.morphologyEx(
-        mask, cv2.MORPH_CLOSE, kernel
-    )
-    return mask
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+    return cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
 
 
 def find_contours(mask):
@@ -37,288 +39,167 @@ def find_contours(mask):
     return contours
 
 
+def center_of(contour):
+    moments = cv2.moments(contour)
+    if moments["m00"] == 0:
+        return None
+    return (
+        int(moments["m10"] / moments["m00"]),
+        int(moments["m01"] / moments["m00"]),
+    )
+
+
 def mouse_callback(event, x, y, flags, param):
-    global selected_blue_center, previous_blue_center
-    global blue_tracking_points, selected_blue_contour
+    """Select a blue contour by clicking anywhere inside it."""
+    global selected_center, previous_center, tracking_points
 
-    if event == cv2.EVENT_LBUTTONDOWN:
-        frame, contours = param
+    if event != cv2.EVENT_LBUTTONDOWN:
+        return
 
-        # Select a blue contour at the clicked location.
-        for contour in contours:
-            if cv2.contourArea(contour) < MIN_BLUE_AREA:
-                continue
-
-            inside = cv2.pointPolygonTest(
-                contour, (float(x), float(y)), False
-            )
-
-            if inside >= 0:
-                M = cv2.moments(contour)
-                if M["m00"] == 0:
-                    continue
-
-                cx = int(M["m10"] / M["m00"])
-                cy = int(M["m01"] / M["m00"])
-
-                selected_blue_center = (cx, cy)
-                previous_blue_center = (cx, cy)
-                blue_tracking_points = [(cx, cy)]
-                selected_blue_contour = contour
-                break
+    for contour in current_blue_contours:
+        if cv2.pointPolygonTest(contour, (float(x), float(y)), False) >= 0:
+            center = center_of(contour)
+            if center is not None:
+                selected_center = center
+                previous_center = center
+                tracking_points = [center]
+            return
 
 
-def detect_tennis_ball(mask):
-    contours = find_contours(mask)
+def find_tennis_ball(mask):
+    """Return the largest sufficiently round tennis-ball color contour."""
     candidates = []
-
-    for contour in contours:
+    for contour in find_contours(mask):
         area = cv2.contourArea(contour)
-
         if area < MIN_BALL_AREA:
             continue
 
         perimeter = cv2.arcLength(contour, True)
-        if perimeter == 0:
+        if perimeter <= 0:
             continue
 
-        circularity = 4 * math.pi * area / (perimeter ** 2)
-
-        # The ball should be approximately circular.
+        circularity = 4 * math.pi * area / (perimeter * perimeter)
         if circularity < 0.55:
             continue
 
         (x, y), radius = cv2.minEnclosingCircle(contour)
+        if radius >= 5:
+            candidates.append((area, contour, (int(x), int(y)), int(radius)))
 
-        if radius < 5:
-            continue
-
-        candidates.append(
-            (area, contour, (int(x), int(y)), int(radius))
-        )
-
-    if not candidates:
-        return None
-
-    # Choose the largest plausible tennis-ball candidate.
-    return max(candidates, key=lambda item: item[0])
+    return max(candidates, key=lambda item: item[0]) if candidates else None
 
 
 def main():
-    global selected_blue_center, previous_blue_center
-    global blue_tracking_points, selected_blue_contour
+    global current_blue_contours, selected_center, previous_center, tracking_points
 
-    cap = cv2.VideoCapture(0)
+    camera = cv2.VideoCapture(0)
+    if not camera.isOpened():
+        raise RuntimeError("Could not open webcam. Try changing camera index 0.")
 
-    if not cap.isOpened():
-        print("Error: Could not open webcam.")
-        return
+    cv2.namedWindow(WINDOW)
+    cv2.setMouseCallback(WINDOW, mouse_callback)
 
-    window = "Blue Object and Tennis Ball Detection"
-    cv2.namedWindow(window)
+    try:
+        while True:
+            ok, frame = camera.read()
+            if not ok:
+                print("Could not read a frame from the webcam.")
+                break
 
-    while True:
-        ret, frame = cap.read()
+            hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+            blue_mask = clean_mask(cv2.inRange(hsv, BLUE_LOWER, BLUE_UPPER))
+            ball_mask = clean_mask(cv2.inRange(hsv, BALL_LOWER, BALL_UPPER))
 
-        if not ret:
-            print("Error: Could not read camera frame.")
-            break
+            current_blue_contours = [
+                contour for contour in find_contours(blue_mask)
+                if cv2.contourArea(contour) >= MIN_BLUE_AREA
+            ]
 
-        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-
-        blue_mask = clean_mask(
-            cv2.inRange(hsv, BLUE_LOWER, BLUE_UPPER)
-        )
-        ball_mask = clean_mask(
-            cv2.inRange(hsv, BALL_LOWER, BALL_UPPER)
-        )
-
-        blue_contours = [
-            c for c in find_contours(blue_mask)
-            if cv2.contourArea(c) >= MIN_BLUE_AREA
-        ]
-
-        # Detect tennis ball independently of the blue object.
-        ball = detect_tennis_ball(ball_mask)
-        ball_center = None
-
-        if ball is not None:
-            ball_area, ball_contour, ball_center, radius = ball
-
-            cv2.circle(
-                frame, ball_center, radius, (0, 255, 255), 2
-            )
-            cv2.circle(
-                frame, ball_center, 4, (0, 0, 255), -1
-            )
-
-            cv2.putText(
-                frame,
-                f"Ball center: {ball_center}",
-                (10, 25),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.6, (0, 255, 255), 2
-            )
-            cv2.putText(
-                frame,
-                f"Radius: {radius}px  Area: {ball_area:.0f}px^2",
-                (10, 50),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.6, (0, 255, 255), 2
-            )
-
-        # Keep tracking the selected blue object.
-        blue_contour = None
-
-        if blue_contours:
-            if previous_blue_center is None:
-                # Before selection, show available blue objects.
-                for c in blue_contours:
-                    x, y, w, h = cv2.boundingRect(c)
-                    cv2.rectangle(
-                        frame, (x, y), (x + w, y + h),
-                        (255, 150, 0), 1
-                    )
+            # Draw unselected blue objects so the user can click one.
+            if selected_center is None:
+                for contour in current_blue_contours:
+                    x, y, w, h = cv2.boundingRect(contour)
+                    cv2.rectangle(frame, (x, y), (x + w, y + h), (255, 150, 0), 1)
+                cv2.putText(frame, "Click a blue object to select it", (10, 25),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 150, 0), 2)
             else:
-                # Find the contour nearest to the previous center.
-                def contour_center(c):
-                    M = cv2.moments(c)
-                    if M["m00"] == 0:
-                        return None
-                    return (
-                        int(M["m10"] / M["m00"]),
-                        int(M["m01"] / M["m00"])
-                    )
-
+                # Follow the nearest blue contour center; works for any contour shape.
                 candidates = []
-                for c in blue_contours:
-                    center = contour_center(c)
+                for contour in current_blue_contours:
+                    center = center_of(contour)
                     if center is not None:
-                        distance = math.dist(
-                            previous_blue_center, center
+                        distance = math.hypot(
+                            center[0] - previous_center[0],
+                            center[1] - previous_center[1],
                         )
-                        candidates.append((distance, c, center))
+                        candidates.append((distance, contour, center))
 
                 if candidates:
-                    distance, blue_contour, blue_center = min(
-                        candidates, key=lambda item: item[0]
-                    )
+                    distance, contour, center = min(candidates, key=lambda item: item[0])
+                    if distance <= MAX_TRACK_DISTANCE:
+                        previous_center = center
+                        selected_center = center
+                        tracking_points.append(center)
+                        tracking_points = tracking_points[-TRAIL_LENGTH:]
 
-                    # Reject a candidate that jumps too far away.
-                    if distance > 150:
-                        blue_contour = None
+                        x, y, w, h = cv2.boundingRect(contour)
+                        area = cv2.contourArea(contour)
+                        cv2.drawContours(frame, [contour], -1, (255, 0, 0), 2)
+                        cv2.rectangle(frame, (x, y), (x + w, y + h), (255, 0, 0), 2)
+                        cv2.circle(frame, center, 4, (255, 255, 255), -1)
+                        cv2.putText(frame, f"Blue object area: {area:.0f} px^2",
+                                    (10, 55), cv2.FONT_HERSHEY_SIMPLEX,
+                                    0.6, (255, 100, 0), 2)
+                        cv2.putText(frame, f"Bounding box: x={x}, y={y}, w={w}, h={h}",
+                                    (10, 80), cv2.FONT_HERSHEY_SIMPLEX,
+                                    0.55, (255, 100, 0), 2)
+
+                        # Center trajectory line.
+                        for i in range(1, len(tracking_points)):
+                            cv2.line(frame, tracking_points[i - 1], tracking_points[i],
+                                     (255, 0, 255), 2)
                     else:
-                        selected_blue_center = blue_center
+                        cv2.putText(frame, "Selected blue object not found", (10, 55),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
+                else:
+                    cv2.putText(frame, "Selected blue object not found", (10, 55),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
 
-        if blue_contour is not None:
-            x, y, w, h = cv2.boundingRect(blue_contour)
-            area = cv2.contourArea(blue_contour)
+            # Tennis ball is detected separately using its own color mask.
+            ball = find_tennis_ball(ball_mask)
+            ball_center = None
+            if ball is not None:
+                ball_area, ball_contour, ball_center, radius = ball
+                cv2.drawContours(frame, [ball_contour], -1, (0, 220, 255), 2)
+                cv2.circle(frame, ball_center, radius, (0, 220, 255), 2)
+                cv2.circle(frame, ball_center, 4, (0, 0, 255), -1)
+                cv2.putText(frame, f"Tennis ball center: {ball_center}", (10, frame.shape[0] - 55),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 220, 255), 2)
+                cv2.putText(frame, f"Radius: {radius}px  Area: {ball_area:.0f} px^2",
+                            (10, frame.shape[0] - 30), cv2.FONT_HERSHEY_SIMPLEX,
+                            0.6, (0, 220, 255), 2)
 
-            M = cv2.moments(blue_contour)
-            if M["m00"] != 0:
-                cx = int(M["m10"] / M["m00"])
-                cy = int(M["m01"] / M["m00"])
-                selected_blue_center = (cx, cy)
+            # Relative position of the blue object with respect to the ball.
+            if selected_center is not None and ball_center is not None:
+                cv2.line(frame, selected_center, ball_center, (0, 255, 0), 2)
+                dx = selected_center[0] - ball_center[0]
+                dy = selected_center[1] - ball_center[1]
+                cv2.putText(frame, f"Blue relative to ball: dx={dx}px, dy={dy}px",
+                            (10, 110), cv2.FONT_HERSHEY_SIMPLEX,
+                            0.55, (0, 255, 0), 2)
 
-                cv2.drawContours(
-                    frame, [blue_contour], -1, (255, 0, 0), 2
-                )
-                cv2.rectangle(
-                    frame, (x, y), (x + w, y + h),
-                    (255, 0, 0), 2
-                )
-                cv2.circle(
-                    frame, (cx, cy), 4, (255, 255, 255), -1
-                )
-
-                cv2.putText(
-                    frame,
-                    f"Blue area: {area:.0f}px^2",
-                    (10, 80),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.6, (255, 100, 0), 2
-                )
-                cv2.putText(
-                    frame,
-                    f"BBox: x={x}, y={y}, w={w}, h={h}",
-                    (10, 105),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.55, (255, 100, 0), 2
-                )
-                cv2.putText(
-                    frame,
-                    f"Blue center: ({cx}, {cy})",
-                    (10, 130),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.6, (255, 100, 0), 2
-                )
-
-                # Draw the blue object's center trajectory.
-                if (
-                    previous_blue_center is not None
-                    and previous_blue_center != (cx, cy)
-                ):
-                    blue_tracking_points.append((cx, cy))
-
-                for i in range(1, len(blue_tracking_points)):
-                    cv2.line(
-                        frame,
-                        blue_tracking_points[i - 1],
-                        blue_tracking_points[i],
-                        (255, 0, 255), 2
-                    )
-
-                # Draw a separate line to the tennis ball.
-                if ball_center is not None:
-                    cv2.line(
-                        frame, (cx, cy), ball_center,
-                        (0, 255, 0), 2
-                    )
-
-                    dx = cx - ball_center[0]
-                    dy = cy - ball_center[1]
-                    distance = math.hypot(dx, dy)
-
-                    cv2.putText(
-                        frame,
-                        f"Relative to ball: dx={dx}, dy={dy}",
-                        (10, 155),
-                        cv2.FONT_HERSHEY_SIMPLEX,
-                        0.55, (0, 255, 0), 2
-                    )
-                    cv2.putText(
-                        frame,
-                        f"Center distance: {distance:.1f}px",
-                        (10, 180),
-                        cv2.FONT_HERSHEY_SIMPLEX,
-                        0.55, (0, 255, 0), 2
-                    )
-
-                previous_blue_center = (cx, cy)
-
-        # Mouse selection uses the current frame and its contours.
-        cv2.setMouseCallback(
-            window, mouse_callback, (frame.copy(), blue_contours)
-        )
-
-        cv2.imshow(window, frame)
-        cv2.imshow("Blue Mask", blue_mask)
-        cv2.imshow("Tennis Ball Mask", ball_mask)
-
-        key = cv2.waitKey(1) & 0xFF
-
-        if key == ord("q") or key == 27:
-            break
-
-        # Press r to reset blue-object selection.
-        if key == ord("r"):
-            selected_blue_center = None
-            previous_blue_center = None
-            blue_tracking_points = []
-            selected_blue_contour = None
-
-    cap.release()
-    cv2.destroyAllWindows()
+            # Show only the color camera feed, with annotations.
+            cv2.imshow(WINDOW, frame)
+            key = cv2.waitKey(1) & 0xFF
+            if key in (ord("q"), 27):
+                break
+            if key == ord("r"):
+                selected_center = None
+                previous_center = None
+                tracking_points = []
+    finally:
+        camera.release()
+        cv2.destroyAllWindows()
 
 
 if __name__ == "__main__":
